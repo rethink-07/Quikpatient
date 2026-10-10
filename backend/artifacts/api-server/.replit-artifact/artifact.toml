@@ -1,0 +1,31 @@
+kind = "api"
+previewPath = "/api"
+title = "QuikPatient API"
+version = "1.0.0"
+id = "3B4_FFSkEVBkAeYMFRJ2e"
+
+[[services]]
+localPort = 8080
+name = "API Server"
+paths = ["/api"]
+
+[services.development]
+run = "python -m uvicorn app.main:app --host 0.0.0.0 --port ${PORT:-8080} --no-access-log"
+
+[services.production]
+
+[services.production.build]
+args = ["python", "-m", "pip", "install", "-r", "artifacts/api-server/requirements.txt"]
+
+[services.production.build.env]
+PYTHONUNBUFFERED = "1"
+
+[services.production.run]
+args = ["sh", "-c", "cd artifacts/api-server && python -m uvicorn app.main:app --host 0.0.0.0 --port ${PORT:-8080} --no-access-log"]
+
+[services.production.run.env]
+PORT = "8080"
+PYTHONUNBUFFERED = "1"
+
+[services.production.health.startup]
+path = "/api/healthz"

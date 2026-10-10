@@ -1,0 +1,62 @@
+services:
+  db:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: quik
+      POSTGRES_PASSWORD: quik
+      POSTGRES_DB: quikpatient
+    ports: ["5432:5432"]
+    volumes: ["pgdata:/var/lib/postgresql/data"]
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U quik"]
+      interval: 5s
+      retries: 10
+
+  redis:
+    image: redis:7-alpine
+    ports: ["6379:6379"]
+
+  minio:
+    image: minio/minio
+    command: server /data --console-address ":9001"
+    environment:
+      MINIO_ROOT_USER: minio
+      MINIO_ROOT_PASSWORD: minio123
+    ports: ["9000:9000", "9001:9001"]
+    volumes: ["miniodata:/data"]
+
+  api:
+    build: ./backend
+    command: uvicorn app.main:app --host 0.0.0.0 --port 8000 --reload
+    env_file: .env
+    volumes: ["./backend:/code"]
+    ports: ["8000:8000"]
+    depends_on:
+      db: {condition: service_healthy}
+      redis: {condition: service_started}
+
+  worker:
+    build: ./backend
+    command: celery -A app.jobs.celery_app worker -l info
+    env_file: .env
+    volumes: ["./backend:/code"]
+    depends_on: [db, redis]
+
+  beat:
+    build: ./backend
+    command: celery -A app.jobs.celery_app beat -l info
+    env_file: .env
+    volumes: ["./backend:/code"]
+    depends_on: [db, redis]
+
+  # streamlit:          # uncomment once frontend/ has files
+  #   build: ./frontend
+  #   command: streamlit run app.py --server.port 8501 --server.address 0.0.0.0
+  #   env_file: .env
+  #   volumes: ["./frontend:/code"]
+  #   ports: ["8501:8501"]
+  #   depends_on: [api]
+
+volumes:
+  pgdata:
+  miniodata:

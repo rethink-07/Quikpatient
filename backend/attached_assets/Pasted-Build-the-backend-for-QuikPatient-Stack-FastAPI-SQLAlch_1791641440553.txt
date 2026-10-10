@@ -1,0 +1,88 @@
+Build the backend for "QuikPatient". Stack: FastAPI + SQLAlchemy 2.0 + Alembic + PostgreSQL 16 (row-level security on), Redis (sessions, rate limits, short-lived SOS state, pub/sub), Celery + beat workers (ABDM fetch, OCR, merge, DEK rotation, SOS expiry, chain anchoring), MinIO/S3 for encrypted blobs, pynacl/libsodium + cryptography, Argon2id passwords, JWT access/refresh + TOTP 2FA. Docker Compose: api, worker, beat, db, redis, minio, streamlit. Pytest suites for crypto, access control, SOS and append-only audit. Full offline MOCK_MODE=true by default for ABDM, NMC/HPR and SMS.
+
+INVARIANTS ENFORCED AT THE API LAYER (never UI-only)
+1. PATIENTS HAVE NO CLINICAL WRITE ACCESS. Reject any patient-authenticated create/update/delete of records, medications, treatments or diagnoses unless source == SELF_REPORTED. Patient-writable surfaces: general info, nominees, consents, keys/passphrase, self-reported uploads (immutable once saved; soft-delete only).
+2. DOCTORS ONLY APPEND. Create prescriptions, notes and amendments where an active non-emergency consent exists. No hard deletes or in-place edits anywhere; corrections are append-only amendments with superseded_by / amends_* linkage.
+3. ANY write endpoint under an EMERGENCY-mode session returns 403, and the scope filter strips non-emergency record types.
+4. Every record read passes a server-side scope check (types + date interval + expiry). Never trust client-supplied scope.
+5. GUARDIAN AND MINOR CONSENT ARE OUT OF SCOPE in this build: any attempt to consent on another patient's behalf returns 403 with reason "guardian_flow_not_implemented". Keep the guardians table and patients.is_minor in the schema so the flow can be added without migration pain.
+6. No PHI in logs, exceptions, URLs, query strings or outbound notification bodies — enforce with a logging filter and an outbound-template validator.
+7. All datetimes stored UTC and tz-aware; expose IST-rendered companion fields. No naive datetimes.
+
+DATA MODEL
+users(id, role patient|doctor|nominee|guardian, login_id, password_hash, totp_secret, status, created_at)
+patients(id, user_id, abha_id, abha_address, name, dob, sex, blood_group, height_cm, weight_kg, emergency_contact, allergies jsonb, chronic_conditions jsonb, general_info_updated_at, is_minor, closed_at)  -- UNENCRYPTED emergency-readable set
+guardians(id, patient_id, user_id, name, relationship, legal_authority, may_consent, verified_at, revoked_at)  -- reserved, enforced 403
+doctors(id, user_id, name, nmc_reg_no, council, specialty, facility_id, verified, verified_at, verification_payload jsonb, public_key, enc_private_key, sos_suspended_until)
+facilities(id, name, hfr_id, address, verified)
+nominees(id, patient_id, name, relationship, phone_e164, email, phone_verified_at, may_approve_emergency, priority, push_token, last_delivery_status, created_at, revoked_at)
+patient_keys(patient_id, kdf_salt, wrapped_master_key, recovery_wrapped_master_key, public_key, enc_private_key, search_key_wrapped, eak_share_a_encrypted, key_version, rotated_at)
+records(id, patient_id, encounter_id, type enum(prescription|diagnostic_report|op_consultation|discharge_summary|immunization|scan|vitals|diagnosis|treatment), record_date, source enum(ABDM_HIU|PROVIDER_DIRECT|SELF_REPORTED), verification enum(VERIFIED|UNVERIFIED), corroborated_by_record_id, merged_into_record_id, attested_by_doctor_id, fhir_resource_type, raw_bundle_ciphertext, ciphertext, nonce, aad, wrapped_dek, blob_key, search_tokens bytea[], tags text[], key_version, created_at, superseded_by, soft_deleted_at)
+medications(id, patient_id, record_id, prescribed_by_doctor_id, name, normalized_name, code, dose, frequency, route, start_date, end_date, status active|stopped|completed|amended, stop_reason, stopped_by_doctor_id, amends_medication_id, source, verification, confirmed_with_patient)
+treatments(id, patient_id, record_id, name, start_date, end_date, amends_treatment_id)
+encounters(id, patient_id, doctor_id, facility_id, mode CONSENTED|EMERGENCY, started_at, ended_at, general_info_confirmed, reason)
+consents(id, patient_id, doctor_id, encounter_id, kind DOCTOR_GRANT|ABDM_ARTEFACT, legal_basis PATIENT_CONSENT|GUARDIAN_CONSENT|NOMINEE_EMERGENCY|BREAK_GLASS, scope_types text[], scope_from, scope_to, expires_at, status active|revoked|expired, revoke_mode soft|hard, abdm_consent_id, artefact jsonb)
+consent_keys(consent_id, record_id, dek_sealed_to_doctor, key_version)
+access_requests(id, doctor_id, patient_id, requested_from, requested_to, types text[], reason, requested_duration, status pending|approved|denied)
+sos_events(id, patient_id, doctor_id, facility_id, identity_method, identity_confidence, declared_reason_code, declared_reason_text, status INITIATED|NOTIFIED|APPROVED|DENIED|EXPIRED|TERMINATED|MINIMUM_SET, legal_basis, approved_by_nominee_id, approved_at, expires_at, scope_types text[], terminated_by, terminated_at, created_at)
+sos_notifications(id, sos_event_id, nominee_id, channel sms|push|ivr, otp_hash, attempt_no, sent_at, delivered_at, responded_at, response)
+abuse_flags(id, subject_doctor_id, reported_by_patient_id, sos_event_id, reason, status open|reviewed|upheld|dismissed, created_at)
+notifications(id, user_id, kind, payload jsonb, read_at, created_at)
+ingestion_jobs(id, patient_id, kind ABDM_FETCH|OCR|MERGE|DEK_ROTATION, status, progress, payload jsonb, error, created_at)
+audit_log(id, patient_id, actor_user_id, actor_role, action, object_type, object_id, scope jsonb, legal_basis, severity info|high, ip, user_agent, ts, prev_hash, entry_hash, actor_signature)  -- INSERT-only
+audit_anchors(id, chain_head_hash, entry_count, anchored_at)
+retention_policies(entity, retain_years, basis)
+drug_dictionary(id, name, normalized_name, synonyms text[], strength_forms jsonb)
+interactions(drug_a, drug_b, severity, description)
+allergy_overrides(id, medication_id, doctor_id, allergy, justification, created_at)
+
+ENCRYPTION (implement exactly; document the trust boundary)
+1. Registration: 32-byte master key MK generated in the client session. KEK = Argon2id(passphrase, random salt, m=64MiB, t=3, p=4). Persist ONLY wrapped_master_key = AES-256-GCM(KEK, MK) plus a second wrap under a 12-word BIP39 recovery code. The server never receives passphrase, KEK or MK.
+2. Per record: random DEK; ciphertext = AES-256-GCM(DEK, canonical_json(payload), aad = record_id||patient_id||type||record_date||key_version); wrapped_dek = AES-256-GCM(MK, DEK). Files use the same DEK into object storage; the DB stores blob_key only. Raw FHIR bundles are stored encrypted alongside parsed rows so a versioned mapper can be re-run.
+3. Patient and doctor each hold an X25519 keypair; the doctor's private key is wrapped under their own Argon2id-derived key.
+4. Consented grant: the patient session unwraps DEKs for in-scope records ONLY (minimum necessary), re-seals each to the doctor's X25519 public key (libsodium sealed box / HPKE), and writes consent_keys with expires_at.
+5. Revocation: soft revoke deletes consent_keys and marks the consent revoked (instant, server-enforced). HARD REVOKE IS SHIPPED: an idempotent DEK_ROTATION job rotates DEKs, re-encrypts affected records, bumps key_version and invalidates all previously sealed keys, with a documented key_version migration path.
+6. EMERGENCY (SOS) KEY PATH — the patient is unavailable so MK cannot be used. At registration derive an Emergency Access Key EAK, wrap a scoped-subset key under it, and split EAK with Shamir 2-of-3: share A encrypted server-side, share B sealed to each nominee's phone/device-derived key, share C printed on the patient's emergency card (offline break-glass). Nominee approval releases share B; combined with A the worker reconstructs EAK and derives a READ-ONLY, single-use, time-boxed key (SOS_TTL_MINUTES, default 60, demo profile 10) sealed to the requesting doctor's public key, scoped to emergency types only (allergies, active medications, recent diagnoses, discharge summaries, recent labs). EAK never confers write capability and is destroyed on expiry or termination. Every step writes a severity=high audit entry.
+7. Multi-device: MK is re-derived from the passphrase on each device. No escrow, no server-side MK. Document that losing passphrase AND recovery code is unrecoverable by design.
+8. Searchable encryption: per record store HMAC-SHA256(search_key, normalized_term) tokens; search_key derives from MK and is sealed per consent. DOCUMENT HONESTLY in the crypto module docstring and threat model that these tokens leak query equality and term frequency — this is not zero-knowledge search.
+9. Audit integrity: entry_hash = SHA256(prev_hash || canonical_json(entry)) with an Ed25519 actor signature. Enforce append-only AT THE DATABASE LEVEL (REVOKE UPDATE, DELETE on audit_log from the app role plus a trigger that blocks mutation), not just in application code. A beat job anchors the chain head into audit_anchors every AUDIT_ANCHOR_INTERVAL_MINUTES. Expose GET /audit/verify to re-walk and verify.
+10. Transport/at-rest: TLS 1.3, PostgreSQL at-rest encryption, RLS keyed on patient_id, 2FA, idle session timeout, audit retention 6 years, synthetic data only.
+
+LEGAL BASIS AND RETENTION
+Record legal_basis on every consent and disclosure: PATIENT_CONSENT, GUARDIAN_CONSENT (reserved), NOMINEE_EMERGENCY, BREAK_GLASS. Nominee-approved access is logged explicitly as nominee-mediated emergency disclosure, NOT patient consent. Account-closure job erases records, blobs and DEKs while RETAINING audit_log with the patient identifier pseudonymised, per retention_policies; document the erasure-versus-audit-integrity tension.
+
+ABDM HIU INTEGRATION (verified ingestion)
+Implement an HIU against the ABDM sandbox behind an AbdmClient interface: gateway session token (client_id/client_secret), ABHA-based patient discovery/auth (OTP), consent-request init with HI types + date range + purpose + expiry, then handle the ASYNCHRONOUS callbacks on FastAPI-only endpoints (never routed through Streamlit): /v0.5/consent-requests/on-init, /consents/hiu/notify, /consents/on-fetch, /health-information/hiu/on-request, and the receiver /data/push. For data transfer, generate an ephemeral Curve25519 keypair + nonce, send keyMaterial in the health-information request, decrypt each incoming FHIR bundle with the computed shared secret, parse it with a VERSIONED mapper (Prescription, DiagnosticReport, OPConsultation, DischargeSummary) into records/medications/treatments with source=ABDM_HIU and verification=VERIFIED, then encrypt and store (retaining the raw bundle encrypted). Report transfer status back to the gateway. Persist the consent artefact and honour its expiry and revocation notifications. A MOCK provider replays saved sandbox fixtures so the demo runs offline. The HIP role (pushing QuikPatient prescriptions back to ABDM) is ROADMAP ONLY — stub it and document it.
+
+DE-DUPLICATION
+A MERGE job reconciles incoming ABDM records against existing SELF_REPORTED ones keyed on doctor + date window + drug/test name + dose fuzzy match (RapidFuzz, thresholded). On match: set merged_into_record_id, keep the verified record canonical, mark the self-reported one corroborated_by_record_id, and never double-count in active medications. Return results to the sync summary for patient review; merges are reversible by append-only amendment.
+
+SELF-REPORTED INGESTION (fallback)
+POST /records/upload accepts PDF/images and queues an OCR job (PaddleOCR or Tesseract, pdfplumber for digital PDFs, layout parsing for tables). Extract document type, date, doctor name, facility, medicines, diagnoses and lab values with PER-FIELD CONFIDENCE. Fuzzy-match medicines against drug_dictionary with suggestions; check doctor names against NMC/HPR and facilities against the registry, returning "matches a registered practitioner" WITHOUT ever setting verification=VERIFIED. Flag low-confidence dose/strength fields for human review and require a per-medicine confirmed flag before persisting. On confirm: source=SELF_REPORTED, verification=UNVERIFIED, original encrypted scan retained as evidence, no auto-promotion ever. Manual entry yields the same status. Self-reported medications are EXCLUDED from the interaction/allergy engine until a doctor sets confirmed_with_patient=true.
+
+SOS / NOMINEE FLOW (doctor-initiated)
+POST /sos/initiate — requires a doctor with current NMC verification and null sos_suspended_until. Body: patient identifiers, identity_method, identity evidence, declared_reason_code + text (mandatory, fixed list). The server resolves the patient with a confidence score, returns a MASKED candidate for confirmation, binds the doctor's facility_id, creates sos_events(status=INITIATED), and applies Redis sliding-window rate limits per doctor (SOS_RATE_LIMIT_PER_DOCTOR_DAY), per patient and per facility, returning 429 with an explanatory code when exceeded.
+POST /sos/{id}/confirm — notifies every nominee with may_approve_emergency in priority order over SMS + push + IVR with per-channel delivery receipts and retry. Message bodies carry ONLY the doctor's verified name, NMC reg no, facility, reason and a one-time link + 6-digit OTP — NO PHI. OTPs hashed, SOS_OTP_TTL_MINUTES validity, limited attempts, first valid response wins. Simultaneously notify the PATIENT on all channels.
+POST /sos/{id}/respond — nominee authenticated by signed token + OTP; APPROVED or DENIED. On approval: run the emergency key path, create encounters(mode=EMERGENCY), create a consent row with legal_basis=NOMINEE_EMERGENCY, read-only scope and expires_at = now + SOS_TTL_MINUTES, and return the sealed key to the doctor's session.
+Fallback: MINIMUM_SET_ON_TIMEOUT IS ENABLED in this build — on timeout or universal denial, grant ONLY the emergency minimum set (name, age, sex, blood group, allergies, active medications) with legal_basis=BREAK_GLASS, status=MINIMUM_SET and a severity=high audit entry. The printed emergency-card share C is the documented offline path.
+POST /sos/{id}/terminate — callable by the patient, any nominee, the requesting doctor or an admin. A beat job expires stale events and destroys keys. Notify the patient at initiation, approval, minimum-set grant and expiry, and surface the event in the changelog.
+POST /sos/{id}/report — the patient files an abuse_flag; configurable thresholds auto-set doctors.sos_suspended_until and block further SOS initiation pending review.
+
+DOCTOR VERIFICATION
+verify_doctor(reg_no, council) with pluggable providers: (a) ABDM HPR sandbox, (b) commercial NMC verification API (Decentro / Surepass / Meon) via env base URL + key, (c) MOCK fixture provider (default). Cache into doctors.verification_payload, re-verify every NMC_REVERIFY_DAYS (180), and block login plus all clinical actions unless verified. Returns {verified, name, council, reg_no, valid_till, source}.
+
+NOTIFICATIONS AND REALTIME
+One notifier service with SMS / push / IVR / email adapters, delivery receipts, retries and a no-PHI template validator. Redis pub/sub fans out to GET /notifications for the frontend bell: abdm_records_added, access_requested, sos_initiated, sos_approved, sos_expired, consent_expiring, merge_review.
+
+API SURFACE
+/auth/* (patient login, doctor login, doctor verify, TOTP, refresh, logout)
+/patients/me (GET/PATCH), /patients/me/nominees (CRUD + OTP verify), /patients/me/guardians (403 not implemented), /patients/me/close
+/records (GET scoped), /records/{id}, /records/upload, /records/ocr-drafts/{id} (GET/PATCH/confirm), /records/merges
+/medications/active, /medications/{id}/stop, /medications/{id}/amend, /treatments
+/abdm/consent-requests (POST/GET), /abdm/callbacks/*, /abdm/sync-status/{job_id}
+/consents (GET/POST/DELETE with ?mode=soft|hard), /consent-keys, /access-requests (POST/GET/approve/deny)
+/doctor/patients, /doctor/unlock, /doctor/patient/{id}/records, /doctor/prescriptions (POST only), /doctor/search
+/sos/initiate, /sos/{id}/confirm, /sos/{id}/respond, /sos/{id}/terminate, /sos/{id}/report, /sos/{id}
+/notifications, /jobs/{id}, /audit, /audit/verify, /healthz, /openapi.json
+
+SEED SCRIPT (backend-owned, single source of truth for demo data) — scripts/seed.py --profile demo creates: 3 synthetic chronic patients (Asha, diabetes, ABHA-linked; Ravi, hypertension + thyroid; Meera, asthma, non-ABHA) with 5+ years of mixed VERIFIED and UNVERIFIED records, one amended and one stopped medication, one corroborated merge, 2 OTP-verified nominees each, one minor flagged is_minor to demo the enforced 403, 2 NMC-verified doctors at 2 facilities (dr.khan physician, dr.iyer ER), sample FHIR bundles, drug dictionary, interaction pairs including one allergy conflict, and a pre-populated verifiable audit chain. In MOCK_MODE, OTPs and SMS bodies print to the worker log.
